@@ -1,0 +1,12 @@
+{
+  "id": "kanju",
+  "name": "看剧",
+  "version": "1.0.0",
+  "description": "看剧 kanju.ai 电影/剧集/短剧/动漫/综艺；HMAC 签名 + 匿名会话，播放直链 m3u8",
+  "runtime": "js",
+  "api": 1,
+  "adult": false,
+  "hosts": ["kanju.ai"],
+  "capabilities": ["search"],
+  "allowEmptyCatalog": false
+}
