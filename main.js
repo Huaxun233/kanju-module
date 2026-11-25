@@ -1,309 +1,295 @@
-// 看剧 kanju.ai 站源模块（Xghub JS 站源，manifest runtime=js api=1）
-//
-// 接口协议（2026-11 实测）：
-//   1. 所有 /v1/* 请求需要 HMAC 签名头：
-//      signature = HMAC-SHA256(SECRET, METHOD + "\n" + path + search + "\n" + ts + "\n" + nonce) hex
-//      headers: x-ai-movie-timestamp(毫秒) x-ai-movie-nonce(32hex) x-ai-movie-signature
-//   2. catalog/episodes/playback 端点需要匿名会话 cookie：
-//      POST /v1/users/anonymous {anonymous_id:<uuid>} → set-cookie
-//   3. 浏览/搜索走 /v1/browse/catalog?kind=|q=；详情 /v1/catalog/<id>；
-//      集数 /v1/catalog/<id>/episodes?offset=；播放 /v1/playback/resolve/<token>。
-//   4. 播放响应 line_options[]：url 以 http 开头的是直链 m3u8；
-//      url 以 resolve:// 开头的是二次令牌，需再调 /v1/playback/resolve/<token>。
-//
-// goja 环境没有 HMAC 与 URLSearchParams，签名用 host.sha256 手写 HMAC，查询串手工拼接。
+// kanju.ai 站源模块（Xghub JS 模块，CommonJS）
+// 接口全图见 kanju-probe；签名 HMAC-SHA256(SECRET, `${METHOD}\n${pathname}${search}\n${ts}\n${nonce}`) hex
+var BASE = "https://kanju.ai";
+var SECRET = "557d0e4ae929f438da6bd84412374e6086b8af09b3fed54bf22601d5bf8c54a0";
 
-const BASE = "https://kanju.ai";
-const SECRET = "557d0e4ae929f438da6bd84412374e6086b8af09b3fed54bf22601d5bf8c54a0";
+var CATEGORIES = [
+  { key: "short_drama", name: "短剧" },
+  { key: "movie", name: "电影" },
+  { key: "series", name: "剧集" },
+  { key: "anime", name: "动漫" },
+  { key: "variety", name: "综艺" },
+  { key: "documentary", name: "纪录片" },
+];
 
-// ---------- 工具 ----------
-
-function enc(value) {
-  return encodeURIComponent(String(value));
+// ---------- 轻工具 ----------
+function randomHex(len) {
+  var s = "";
+  while (s.length < len) s += Math.floor(Math.random() * 16).toString(16);
+  return s.slice(0, len);
 }
 
-function query(params) {
-  const parts = [];
-  for (const key in params) {
-    if (params[key] !== undefined && params[key] !== null) {
-      parts.push(enc(key) + "=" + enc(params[key]));
-    }
+function queryString(params) {
+  var parts = [];
+  for (var k in params) {
+    if (params[k] === undefined || params[k] === null || params[k] === "") continue;
+    parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(params[k]));
   }
   return parts.join("&");
 }
 
-function bytesConcat(parts) {
-  let total = 0;
-  for (const p of parts) total += p.length;
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const p of parts) {
-    out.set(p, offset);
-    offset += p.length;
+// 手写 HMAC-SHA256（host.sha256 接受字节数组，返回字节数组）
+// 注意：真实宿主返回 Uint8Array，Array.prototype.concat 会把整个 TypedArray
+// 当成单个元素塞进去导致签名错误，必须按下标逐字节拼接（与 hongguo 模块同法）。
+function concatBytes(a, b) {
+  var out = new Uint8Array(a.length + b.length);
+  var offset = 0;
+  for (var i = 0; i < a.length; i++) out[offset++] = a[i];
+  for (var j = 0; j < b.length; j++) out[offset++] = b[j];
+  return out;
+}
+
+function hmacSha256(keyBytes, messageBytes) {
+  var blockSize = 64;
+  var key = keyBytes;
+  if (key.length > blockSize) key = host.sha256(key);
+  var ipad = new Uint8Array(blockSize);
+  var opad = new Uint8Array(blockSize);
+  for (var i = 0; i < blockSize; i++) {
+    var b = i < key.length ? key[i] : 0;
+    ipad[i] = b ^ 0x36;
+    opad[i] = b ^ 0x5c;
+  }
+  var inner = host.sha256(concatBytes(ipad, messageBytes));
+  return host.sha256(concatBytes(opad, inner));
+}
+
+function bytesOf(str) {
+  // UTF-8 编码字符串 → 字节数组
+  var u8 = host.utf8Encode(str);
+  return u8;
+}
+
+function hexOf(bytes) {
+  var out = "";
+  for (var i = 0; i < bytes.length; i++) {
+    out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
   }
   return out;
 }
 
-function xorPad(key, pad) {
-  const out = new Uint8Array(64);
-  for (let i = 0; i < 64; i++) {
-    out[i] = (i < key.length ? key[i] : 0) ^ pad;
+// ---------- 签名请求 ----------
+var sessionCookie = "";
+var anonymousId = "";
+
+function signedRequest(pathWithQuery, method) {
+  method = (method || "GET").toUpperCase();
+  var ts = String(Date.now());
+  var nonce = randomHex(32);
+  var message = method + "\n" + pathWithQuery + "\n" + ts + "\n" + nonce;
+  var sig = hexOf(hmacSha256(bytesOf(SECRET), bytesOf(message)));
+  var res = host.fetch({
+    method: method,
+    url: BASE + pathWithQuery,
+    headers: {
+      "x-ai-movie-timestamp": ts,
+      "x-ai-movie-nonce": nonce,
+      "x-ai-movie-signature": sig,
+      Cookie: sessionCookie || "",
+    },
+  });
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error("kanju 接口请求失败（HTTP " + res.status + "）");
+  }
+  // 记录会话 cookie（若有）
+  var setCookies = headerValues(res.headers, "set-cookie");
+  for (var i = 0; i < setCookies.length; i++) {
+    var part = String(setCookies[i]).split(";")[0];
+    if (part) sessionCookie = sessionCookie ? sessionCookie + "; " + part : part;
+  }
+  return JSON.parse(res.body);
+}
+
+// Go 宿主 Header map key 规范化为 "Set-Cookie"，node 测试台是小写；大小写不敏感取
+function headerValues(headers, name) {
+  var out = [];
+  var lower = String(name).toLowerCase();
+  for (var k in headers) {
+    if (String(k).toLowerCase() === lower) {
+      var arr = headers[k];
+      if (arr && arr.length) for (var i = 0; i < arr.length; i++) out.push(String(arr[i]));
+    }
   }
   return out;
 }
 
-// HMAC-SHA256，返回 hex。key 与 message 都是字符串。
-function hmacSha256Hex(keyText, messageText) {
-  let key = host.utf8Encode(keyText);
-  if (key.length > 64) key = new Uint8Array(host.sha256(key));
-  const inner = bytesConcat([xorPad(key, 0x36), host.utf8Encode(messageText)]);
-  const innerHash = new Uint8Array(host.sha256(inner));
-  const outer = bytesConcat([xorPad(key, 0x5c), innerHash]);
-  return host.hexEncode(host.sha256(outer));
-}
-
-function randomHex(bytes) {
-  return host.hexEncode(host.randomBytes(bytes));
-}
-
-function uuid() {
-  const h = randomHex(16);
-  return (
-    h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" +
-    h.slice(16, 20) + "-" + h.slice(20, 32)
-  );
-}
-
-// ---------- 会话 ----------
-
-const SESSION_KEY = "kanju:session";
-const ANON_KEY = "kanju:anon-id";
-
-function ensureSession() {
-  let cookie = host.cacheGet(SESSION_KEY);
-  if (cookie && String(cookie).indexOf("=") >= 0) {
-    return String(cookie);
-  }
-  let anonId = host.cacheGet(ANON_KEY);
+function createSession() {
+  var anonId = host.cacheGet("kanju:anon-id");
   if (!anonId) {
-    anonId = uuid();
-    host.cacheSet(ANON_KEY, anonId, 90 * 24 * 3600 * 1000);
+    anonId = randomHex(32);
+    host.cacheSet("kanju:anon-id", anonId, 90 * 24 * 3600 * 1000);
   }
-  const path = "/v1/users/anonymous";
-  const response = api("POST", path, { anonymous_id: anonId });
-  if (response.status !== 200 && response.status !== 201) {
-    throw new Error("看剧匿名会话创建失败（HTTP " + response.status + "）");
+  var ts = String(Date.now());
+  var nonce = randomHex(32);
+  var message = "POST\n/v1/users/anonymous\n" + ts + "\n" + nonce;
+  var sig = hexOf(hmacSha256(bytesOf(SECRET), bytesOf(message)));
+  var res = host.fetch({
+    method: "POST",
+    url: BASE + "/v1/users/anonymous",
+    headers: {
+      "x-ai-movie-timestamp": ts,
+      "x-ai-movie-nonce": nonce,
+      "x-ai-movie-signature": sig,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ anonymous_id: anonId }),
+  });
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error("kanju 匿名会话创建失败（HTTP " + res.status + "）");
   }
-  const cookies = (response.headers && response.headers["set-cookie"]) || [];
-  const parts = [];
-  for (const line of cookies) {
-    parts.push(String(line).split(";")[0]);
+  var setCookies = headerValues(res.headers, "set-cookie");
+  var cookieParts = [];
+  for (var i = 0; i < setCookies.length; i++) {
+    var part = String(setCookies[i]).split(";")[0];
+    if (part && part.indexOf("=") >= 0) cookieParts.push(part);
   }
-  cookie = parts.join("; ");
-  if (!cookie) {
-    throw new Error("看剧匿名会话未返回会话 cookie");
+  if (!cookieParts.length) {
+    throw new Error("kanju 匿名会话未返回会话 cookie");
   }
-  host.cacheSet(SESSION_KEY, cookie, 12 * 3600 * 1000);
-  return cookie;
+  sessionCookie = cookieParts.join("; ");
+  host.cacheSet("kanju:session", sessionCookie, 2 * 3600 * 1000);
+  return sessionCookie;
 }
 
 function dropSession() {
-  host.cacheSet(SESSION_KEY, null, 0);
+  sessionCookie = "";
+  host.cacheSet("kanju:session", "", 1000);
 }
 
-// ---------- API ----------
-
-function api(method, pathWithQuery, body, cookie) {
-  const ts = String(Date.now());
-  const nonce = randomHex(16);
-  const signature = hmacSha256Hex(SECRET, method + "\n" + pathWithQuery + "\n" + ts + "\n" + nonce);
-  const headers = {
-    "User-Agent": "Mozilla/5.0",
-    Accept: "application/json",
-    "x-ai-movie-timestamp": ts,
-    "x-ai-movie-nonce": nonce,
-    "x-ai-movie-signature": signature,
-  };
-  if (cookie) headers["cookie"] = cookie;
-  const request = { method: method, url: BASE + pathWithQuery, headers: headers, timeoutMs: 20000 };
-  if (body !== undefined && body !== null) {
-    headers["Content-Type"] = "application/json";
-    request.body = JSON.stringify(body);
+function ensureSession() {
+  if (sessionCookie) return;
+  var cached = host.cacheGet("kanju:session");
+  if (cached && String(cached).indexOf("=") >= 0) {
+    sessionCookie = String(cached);
+    return;
   }
-  return host.fetch(request);
+  createSession();
 }
 
-function apiJson(method, pathWithQuery, body, cookie) {
-  const response = api(method, pathWithQuery, body, cookie);
-  if (response.status < 200 || response.status >= 300) {
-    throw new Error("看剧接口 " + pathWithQuery + " 返回 HTTP " + response.status);
-  }
-  try {
-    return JSON.parse(response.body);
-  } catch (error) {
-    throw new Error("看剧接口 " + pathWithQuery + " 返回的不是 JSON");
-  }
-}
-
-// ---------- 分类 ----------
-
-const CATEGORIES = [
-  { id: "short_drama", name: "短剧" },
-  { id: "movie", name: "电影" },
-  { id: "series", name: "剧集" },
-  { id: "anime", name: "动漫" },
-  { id: "variety", name: "综艺" },
-  { id: "documentary", name: "纪录片" },
-];
-
+// 兼容宿主期望的导出形式
 function validCategory(category) {
-  return category === "" || CATEGORIES.some((entry) => entry.id === category);
+  for (var i = 0; i < CATEGORIES.length; i++) {
+    if (CATEGORIES[i].key === category) return true;
+  }
+  return false;
 }
 
-// ---------- 卡片 → Drama ----------
+function categories() {
+  return CATEGORIES.map(function (c) { return c.name; });
+}
 
-function toDrama(card) {
-  return {
-    id: card.id,
-    source: host.source,
-    sourceId: card.id,
-    title: card.title || card.normalized_title || "未知",
-    name: card.title || card.normalized_title || "未知",
-    desc: card.description || "",
-    intro: card.description || "",
-    coverUrl: card.poster_url || card.backdrop_url || "",
-    totalEpisode: card.current_episode_count || (card.availability && card.availability.episode_count) || "",
-    remark: String(card.remarks || ""),
-    tags: Array.isArray(card.genres) ? card.genres : [],
-    category: card.content_kind || "",
+function catalogPage(page, category) {
+  var params = { kind: category || "short_drama", page: page || 1, limit: 24 };
+  var q = queryString(params);
+  var data = signedRequest("/v1/browse/catalog?" + q);
+  var items = (data.cards || []).map(function (c) {
+    return {
+      id: host.dramaId(c.id),
+      source: "kanju",
+      sourceId: c.id,
+      title: c.title,
+      coverUrl: c.poster_url || c.backdrop_url || "",
+      remark: c.remarks || "",
+      totalEpisode: c.episode_count || 0,
+      tags: [c.content_kind || ""],
+    };
+  });
+  return { items: items, hasMore: !!(data.pagination && data.pagination.has_more) };
+}
+
+function search(page, query) {
+  var params = { q: query, page: page || 1, limit: 24 };
+  var data = signedRequest("/v1/browse/catalog?" + queryString(params));
+  var items = (data.cards || []).map(function (c) {
+    return {
+      id: host.dramaId(c.id),
+      source: "kanju",
+      sourceId: c.id,
+      title: c.title,
+      coverUrl: c.poster_url || c.backdrop_url || "",
+      remark: c.remarks || "",
+      totalEpisode: c.episode_count || 0,
+      tags: [c.content_kind || ""],
+    };
+  });
+  return { items: items, hasMore: !!(data.pagination && data.pagination.has_more) };
+}
+
+function detail(sourceId) {
+  ensureSession();
+  var d = signedRequest("/v1/catalog/" + encodeURIComponent(sourceId));
+  var drama = {
+    id: host.dramaId(sourceId),
+    source: "kanju",
+    sourceId: d.id || sourceId,
+    title: d.title,
+    name: d.title,
+    desc: d.description || "",
+    intro: d.description || "",
+    coverUrl: d.poster_url || d.backdrop_url || "",
+    totalEpisode: d.current_episode_count || 0,
+    remark: d.remarks || "",
+    tags: d.genres || [],
   };
+  // 分集列表
+  var episodes = [];
+  var offset = 0;
+  var guard = 0;
+  while (guard++ < 40) {
+    var ed = signedRequest("/v1/catalog/" + encodeURIComponent(sourceId) + "/episodes?offset=" + offset + "&limit=48");
+    var list = ed.episodes || [];
+    for (var i = 0; i < list.length; i++) {
+      episodes.push(list[i]);
+    }
+    var pg = ed.episode_pagination || {};
+    if (!pg.has_more) break;
+    offset += list.length;
+  }
+  var chapters = episodes.map(function (ep, idx) {
+    return {
+      id: host.chapterId(drama.sourceId, String(ep.token || ep.id || idx)),
+      source: "kanju",
+      title: ep.title || "第" + (idx + 1) + "集",
+      videoUrl: "",
+      currentEpisode: idx,
+      vip: false,
+      token: ep.token || "",
+    };
+  });
+  return { drama: drama, chapters: chapters };
 }
 
-// ---------- 导出 ----------
+function resolveOnce(token) {
+  var data = signedRequest("/v1/playback/resolve/" + token);
+  var lines = data.line_options || [];
+  for (var i = 0; i < lines.length; i++) {
+    var u = String(lines[i].url || "");
+    if (u.indexOf("http") === 0) {
+      return { url: u, credentials: { cookie: sessionCookie } };
+    }
+  }
+  throw new Error("kanju 该分集无可播放直链");
+}
+
+function resolveMedia(task) {
+  ensureSession();
+  var chapter = task.chapter || {};
+  var token = chapter.token || String(chapter.id || "").split(":").pop();
+  try {
+    return resolveOnce(token);
+  } catch (eFirst) {
+    // 会话失效/无权访问：丢弃旧会话，重建匿名会话再试一次
+    dropSession();
+    createSession();
+    return resolveOnce(token);
+  }
+}
 
 module.exports = {
-  validCategory,
-
-  categories() {
-    return CATEGORIES;
-  },
-
-  catalogPage(page, category) {
-    if (!validCategory(category)) {
-      throw new Error("看剧模块没有分类 " + category);
-    }
-    const kind = category || CATEGORIES[0].id;
-    const data = apiJson("GET", "/v1/browse/catalog?" + query({
-      kind: kind,
-      page: page,
-      limit: 24,
-      sort: "updated_desc",
-    }));
-    const cards = data.cards || [];
-    const pagination = data.pagination || {};
-    return { items: cards.map(toDrama), hasMore: !!pagination.has_more };
-  },
-
-  search(page, queryText) {
-    if (String(queryText).trim() === "") {
-      return { items: [], hasMore: false };
-    }
-    const data = apiJson("GET", "/v1/browse/catalog?" + query({
-      q: String(queryText).trim(),
-      page: page,
-      limit: 24,
-    }));
-    const cards = data.cards || [];
-    const pagination = data.pagination || {};
-    return { items: cards.map(toDrama), hasMore: !!pagination.has_more };
-  },
-
-  detail(sourceId) {
-    const id = String(sourceId).trim();
-    if (id === "") {
-      throw new Error("看剧模块剧集 ID 为空");
-    }
-    const cookie = ensureSession();
-    const detail = apiJson("GET", "/v1/catalog/" + enc(id), undefined, cookie);
-    const card = detail.card || detail.catalog || detail;
-    const drama = toDrama(card);
-
-    // 集数分页拉全（每页 48）
-    const chapters = [];
-    let offset = 0;
-    for (let guard = 0; guard < 40; guard++) {
-      const eps = apiJson("GET", "/v1/catalog/" + enc(id) + "/episodes?" + query({
-        offset: offset,
-        limit: 48,
-      }), undefined, cookie);
-      const list = eps.episodes || [];
-      for (const ep of list) {
-        const track = String(ep.episode_track || "");
-        const isExtra = track !== "" && track.indexOf("正片") < 0;
-        chapters.push({
-          id: host.chapterId(id, ep.token || ep.key || ep.id),
-          source: host.source,
-          title: (isExtra ? "[花絮] " : "") + (ep.title || ep.key || "第 " + (chapters.length + 1) + " 集"),
-          currentEpisode: ep.episode_number || chapters.length + 1,
-          vip: false,
-        });
-      }
-      const pagination = eps.episode_pagination || {};
-      if (!pagination.has_more || list.length === 0) break;
-      offset += list.length;
-    }
-    return { drama: drama, chapters: chapters };
-  },
-
-  resolveMedia(task) {
-    const chapterId = task && task.chapter && task.chapter.id;
-    if (!chapterId) {
-      throw new Error("播放任务缺少分集 ID");
-    }
-    // chapter.id = "kanju:<dramaId>:<token>"，token 是最后一段
-    const token = String(chapterId).split(":").pop();
-    let cookie = ensureSession();
-    let url = resolveToken(token, cookie);
-    if (!url) {
-      // 会话可能过期：重建再试一次
-      dropSession();
-      cookie = ensureSession();
-      url = resolveToken(token, cookie);
-    }
-    if (!url) {
-      throw new Error("看剧未拿到可播放的直链");
-    }
-    return { url: url, credentials: { cookie: cookie, origin: BASE, referer: BASE + "/" } };
-  },
+  validCategory: validCategory,
+  categories: categories,
+  catalogPage: catalogPage,
+  search: search,
+  detail: detail,
+  resolveMedia: resolveMedia,
 };
-
-// 解析一次 /v1/playback/resolve/<token>：
-// 返回 { url, next } —— url 是 http 直链时 next 为空；resolve:// 时 next 是下一跳 token。
-function resolveOnce(token, cookie) {
-  const data = apiJson("GET", "/v1/playback/resolve/" + enc(token), undefined, cookie);
-  const lines = data.line_options || [];
-  for (const line of lines) {
-    const url = String(line.url || "");
-    if (url.indexOf("http://") === 0 || url.indexOf("https://") === 0) {
-      return { url: url, next: null };
-    }
-  }
-  for (const line of lines) {
-    const url = String(line.url || "");
-    if (url.indexOf("resolve://") === 0) {
-      return { url: null, next: url.slice("resolve://".length) };
-    }
-  }
-  return { url: null, next: null };
-}
-
-function resolveToken(token, cookie) {
-  let current = token;
-  for (let hop = 0; hop < 3; hop++) {
-    const result = resolveOnce(current, cookie);
-    if (result.url) return result.url;
-    if (!result.next) return null;
-    current = result.next;
-  }
-  return null;
-}
